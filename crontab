@@ -1,0 +1,20 @@
+# Football Data Processor - Crontab interno do container
+# Todas as rotinas executam automaticamente
+
+# Full load diário às 3h da madrugada
+0 3 * * * cd /app && python football_processor.py full >> /app/logs/full.log 2>&1
+
+# Auto mode a cada 15 minutos (sistema inteligente decide o que fazer)
+*/15 * * * * cd /app && python football_processor.py auto >> /app/logs/auto.log 2>&1
+
+# Sync de odds a cada 2 horas durante horário comercial
+0 */2 8-22 * * * cd /app && python football_processor.py odds >> /app/logs/odds.log 2>&1
+
+# Sync de ligas uma vez por dia às 6h
+0 6 * * * cd /app && python football_processor.py leagues >> /app/logs/leagues.log 2>&1
+
+# Limpeza de logs antigas (manter últimos 7 dias)
+0 4 * * * find /app/logs -name "*.log" -type f -mtime +7 -delete
+
+# Log de status a cada 6 horas para monitoramento
+0 */6 * * * cd /app && python football_processor.py --status >> /app/logs/status.log 2>&1

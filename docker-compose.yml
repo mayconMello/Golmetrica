@@ -1,0 +1,52 @@
+version: '3.8'
+
+services:
+  football-scheduler:
+    build: .
+    container_name: football-scheduler
+    restart: unless-stopped
+    environment:
+      # Configurações básicas
+      - SUPABASE_URL=${SUPABASE_URL}
+      - SUPABASE_ANON_KEY=${SUPABASE_ANON_KEY}
+      - AF_API_KEY=${AF_API_KEY}
+      - AF_BASE_URL=${AF_BASE_URL:-https://v3.football.api-sports.io}
+
+      # Configurações do sistema
+      - DEFAULT_TIMEZONE=${DEFAULT_TIMEZONE:-America/Sao_Paulo}
+      - AF_SEASON=${AF_SEASON:-2025}
+      - REQUEST_LIMIT_DAILY=${REQUEST_LIMIT_DAILY:-7500}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - TZ=America/Sao_Paulo   # <<< garante timezone dentro do container
+
+      # Configurações específicas
+      - AF_LEAGUE_IDS=${AF_LEAGUE_IDS:-}
+      - AF_BOOKMAKER_IDS=${AF_BOOKMAKER_IDS:-}
+      - AF_MAX_FIXTURES=${AF_MAX_FIXTURES:-100}
+
+      # Estratégia de agendamento
+      - SCHEDULE_STRATEGY=${SCHEDULE_STRATEGY:-balanced}
+
+      # Agendamentos customizados (opcional)
+      - CUSTOM_FULL_SCHEDULE=${CUSTOM_FULL_SCHEDULE:-}
+      - CUSTOM_INCREMENTAL_INTERVAL=${CUSTOM_INCREMENTAL_INTERVAL:-}
+
+    command: python /app/scheduler.py
+
+    volumes:
+      - ./logs:/app/logs
+
+    healthcheck:
+      test: ["CMD", "python", "/app/football_processor.py", "--status"]
+      interval: 30m
+      timeout: 30s
+      retries: 3
+      start_period: 1m
+
+    labels:
+      - "com.docker.compose.service=football-scheduler"
+      - "description=Football data processor with intelligent scheduling"
+
+volumes:
+  logs:
+    driver: local
