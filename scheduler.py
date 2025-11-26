@@ -1,16 +1,16 @@
-import json
 import logging
 import os
 import signal
 import subprocess
 import sys
-from datetime import datetime, timedelta
+import time
 from threading import Event
 
 import pytz
 import schedule
 from decouple import config
 
+# Configuração de Logs
 LOG_LEVEL = config("LOG_LEVEL", default="INFO").upper()
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL),
@@ -20,8 +20,13 @@ logging.basicConfig(
 
 logger = logging.getLogger("scheduler")
 
+# Configuração de Timezone e Caminhos
 TIMEZONE = config("DEFAULT_TIMEZONE", default="America/Sao_Paulo")
-tz = pytz.timezone(TIMEZONE)
+try:
+    tz = pytz.timezone(TIMEZONE)
+except pytz.UnknownTimeZoneError:
+    logger.warning(f"Timezone {TIMEZONE} not found, defaulting to UTC")
+    tz = pytz.UTC
 
 PROCESSOR_PATH = os.path.join(os.path.dirname(__file__), "football_processor.py")
 
@@ -34,27 +39,29 @@ def signal_handler(sig, frame):
 
 
 def run_command(command_type: str) -> bool:
-    """Executa um comando do football processor"""
+    """Executa um comando do football processor via subprocesso"""
     try:
         logger.info(f"Starting command: {command_type}")
 
+        # Removido '--force' pois o novo processador não usa mais
         result = subprocess.run(
-            [sys.executable, PROCESSOR_PATH, command_type, "--force"],
+            [sys.executable, PROCESSOR_PATH, command_type],
             capture_output=True,
             text=True,
-            timeout=3600,
-            env=os.environ.copy()  # garante as env vars
+            timeout=3600,  # 1 hora de timeout
+            env=os.environ.copy()
         )
 
         if result.returncode == 0:
             logger.info(f"Command '{command_type}' completed successfully")
-            if result.stdout:
-                logger.info(f"STDOUT: {result.stdout.strip()[:500]}")
+            # Loga apenas se houver algo relevante no stdout (opcional)
+            # if result.stdout:
+            #     logger.debug(f"STDOUT: {result.stdout.strip()[:200]}...")
             return True
         else:
             logger.error(f"Command '{command_type}' failed with code {result.returncode}")
             if result.stderr:
-                logger.error(f"STDERR: {result.stderr.strip()[:500]}")
+                logger.error(f"STDERR: {result.stderr.strip()}")
             return False
 
     except subprocess.TimeoutExpired:
@@ -65,139 +72,94 @@ def run_command(command_type: str) -> bool:
         return False
 
 
-
 def check_system_health() -> bool:
-    """Verifica se o sistema está funcionando"""
-    try:
-        result = subprocess.run(
-            [sys.executable, PROCESSOR_PATH, "--status"],
-            capture_output=True,
-            text=True,
-            timeout=30
-        )
-        return result.returncode == 0
-    except:
-        return False
+    """Verifica se o script do processador está acessível"""
+    return os.path.exists(PROCESSOR_PATH)
 
+
+# --- Definição dos Jobs ---
 
 def job_full_load():
-    logger.info("🔄 Executing FULL LOAD job")
-    success = run_command("full")
-    logger.info("✅ FULL LOAD" if success else "❌ FULL LOAD failed")
+    logger.info("🔄 Executing FULL LOAD job (Leagues, Standings, Fixtures)")
+    run_command("full")
 
 
 def job_incremental():
-    logger.info("⚡ Executing INCREMENTAL job")
-    success = run_command("incremental")
-    logger.info("✅ INCREMENTAL" if success else "❌ INCREMENTAL failed")
+    logger.info("⚡ Executing INCREMENTAL job (Live scores, Predictions)")
+    run_command("incremental")
 
 
 def job_leagues():
     logger.info("🏆 Executing LEAGUES job")
-    success = run_command("leagues")
-    logger.info("✅ LEAGUES" if success else "❌ LEAGUES failed")
+    run_command("leagues")
 
 
 def job_odds():
     logger.info("🎰 Executing ODDS job")
-    success = run_command("odds")
-    logger.info("✅ ODDS" if success else "❌ ODDS failed")
+    run_command("odds")
 
 
-def job_auto():
-    logger.info("🤖 Executing AUTO job")
-    success = run_command("auto")
-    logger.info("✅ AUTO" if success else "❌ AUTO failed")
+def job_squads():
+    logger.info("busts Executing SQUADS job (Players & Photos)")
+    run_command("squads")
+
+
+def job_standings():
+    logger.info("📊 Executing STANDINGS job")
+    run_command("standings")
 
 
 def job_health_check():
     logger.info("🩺 Executing health check")
     if check_system_health():
-        logger.info("✅ System health OK")
+        logger.info("✅ System processor file found")
     else:
-        logger.warning("⚠️ System health check failed")
+        logger.error(f"❌ Processor file not found at {PROCESSOR_PATH}")
 
 
-def job_schedule_fixtures():
-    """Agenda jobs incrementais dinâmicos próximos dos jogos"""
-    logger.info("📅 Checking upcoming fixtures for dynamic scheduling...")
-
-    try:
-
-        result = subprocess.run(
-            [sys.executable, PROCESSOR_PATH, "incremental", "--status"],
-            capture_output=True,
-            text=True,
-            timeout=60
-        )
-
-        if result.returncode != 0 or not result.stdout:
-            logger.warning("⚠️ Could not fetch fixtures for scheduling")
-            return
-
-        status = json.loads(result.stdout)
-
-        fixtures = status.get("upcoming_fixtures", [])
-
-        if not fixtures:
-            logger.info("Nenhum fixture encontrado para agendamento")
-            return
-
-        kickoff_times = {}
-        for f in fixtures:
-            start_str = f.get("start_utc")
-            if not start_str:
-                continue
-            try:
-                dt = datetime.fromisoformat(start_str.replace("Z", "+00:00")).astimezone(tz)
-                kickoff_times.setdefault(dt, []).append(f["id"])
-            except Exception:
-                continue
-
-        for kickoff_dt, games in kickoff_times.items():
-
-            for offset in [0, 5]:
-                sched_time = (kickoff_dt + timedelta(minutes=offset)).strftime("%H:%M")
-                schedule.every().day.at(sched_time, tz).do(job_incremental)
-                logger.info(f"⚡ Scheduled incremental at {sched_time} for {len(games)} games")
-
-    except Exception as e:
-        logger.error(f"Failed to dynamically schedule fixtures: {e}")
-
+# --- Configuração do Cronograma ---
 
 def setup_schedules():
-    """Configura agendamentos"""
-    logger.info("📅 Setting up schedule strategy (HYBRID)")
+    """Configura a estratégia de agendamento"""
+    logger.info("📅 Setting up schedule strategy")
 
+    # 1. Carga Pesada (Madrugada)
     schedule.every().day.at("03:00", tz).do(job_full_load)
 
-    for hour in range(12, 24):
-        for minute in [0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55]:
-            schedule.every().day.at(f"{hour:02d}:{minute:02d}", tz).do(job_incremental)
+    # 2. Atualização de Elencos (Uma vez por dia, cedo)
+    schedule.every().day.at("04:00", tz).do(job_squads)
 
-    for hour in list(range(0, 12)) + [23]:
-        for minute in [0, 30]:
-            schedule.every().day.at(f"{hour:02d}:{minute:02d}", tz).do(job_incremental)
+    # 3. Ligas e Tabelas (Manhã)
+    schedule.every().day.at("05:00", tz).do(job_leagues)
+    schedule.every().day.at("06:00", tz).do(job_standings)
 
+    # 4. Odds (Vários momentos do dia para pegar movimentos de mercado)
     schedule.every().day.at("10:00", tz).do(job_odds)
     schedule.every().day.at("16:00", tz).do(job_odds)
     schedule.every().day.at("20:00", tz).do(job_odds)
 
-    schedule.every().day.at("05:00", tz).do(job_leagues)
+    # 5. Incremental (Jogos ao Vivo e Atualizações Rápidas)
+    # Horário Nobre (12:00 - 23:59): A cada 5 minutos
+    for hour in range(12, 24):
+        for minute in range(0, 60, 5):  # 0, 5, 10, ... 55
+            schedule.every().day.at(f"{hour:02d}:{minute:02d}", tz).do(job_incremental)
 
+    # Horário de Baixa (00:00 - 11:59): A cada 30 minutos (para jogos noturnos/outros fusos)
+    for hour in range(0, 12):
+        for minute in [0, 30]:
+            schedule.every().day.at(f"{hour:02d}:{minute:02d}", tz).do(job_incremental)
+
+    # 6. Health Check
     schedule.every(1).hours.do(job_health_check)
 
-    schedule.every().hour.at(":00").do(job_schedule_fixtures)
-
-    logger.info("📋 Scheduled jobs:")
-    for job in schedule.get_jobs():
-        logger.info(f"  - {job}")
+    logger.info(f"📋 Scheduled {len(schedule.get_jobs())} jobs.")
 
 
 def main():
     logger.info("🚀 Football Data Processor Scheduler starting...")
     logger.info(f"🌍 Using timezone: {TIMEZONE}")
 
+    # Configura handlers para encerramento gracioso (CTRL+C, Docker stop)
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
@@ -206,15 +168,19 @@ def main():
     logger.info("🔍 Initial health check...")
     job_health_check()
 
+    # Loop principal
     try:
         while not shutdown_event.is_set():
             schedule.run_pending()
-            if shutdown_event.wait(60):
+            # Verifica shutdown a cada segundo para resposta rápida
+            if shutdown_event.wait(1):
                 break
     except KeyboardInterrupt:
         logger.info("🛑 Keyboard interrupt received")
-
-    logger.info("🏁 Scheduler stopped gracefully")
+    except Exception as e:
+        logger.critical(f"🔥 Scheduler crashed: {e}")
+    finally:
+        logger.info("🏁 Scheduler stopped gracefully")
 
 
 if __name__ == "__main__":
