@@ -32,6 +32,10 @@ DEFAULT_TZ = config("DEFAULT_TIMEZONE", default="America/Sao_Paulo")
 SEASON = int(config("AF_SEASON", default="2025"))
 MAX_IDS_PER_BATCH = int(config("MAX_IDS_PER_BATCH", default=20))
 
+# Configuração de validade das predições (em horas)
+PREDICTION_STALE_HOURS = int(config("PREDICTION_STALE_HOURS", default=24))
+PREDICTION_BATCH_SIZE = int(config("PREDICTION_BATCH_SIZE", default=50))
+
 
 # ==============================================================================
 # MODELOS (PYDANTIC)
@@ -276,6 +280,25 @@ class DatabaseService:
         res = query.execute()
         return [r["id"] for r in res.data]
 
+    def get_prediction_candidates(self, fixture_ids: List[int], stale_hours: int = 24) -> List[int]:
+        if not fixture_ids: return []
+        res = self.client.table("predictions").select("fixture_id, updated_at").in_("fixture_id", fixture_ids).execute()
+        existing_map = {r["fixture_id"]: r["updated_at"] for r in res.data}
+        candidates = []
+        now = datetime.now(timezone.utc)
+        threshold = timedelta(hours=stale_hours)
+        for fid in fixture_ids:
+            if fid not in existing_map:
+                candidates.append(fid)
+            else:
+                try:
+                    last_update = datetime.fromisoformat(existing_map[fid].replace("Z", "+00:00"))
+                    if (now - last_update) > threshold:
+                        candidates.append(fid)
+                except Exception:
+                    candidates.append(fid)
+        return candidates
+
     def get_ids_missing_predictions(self, fixture_ids: List[int]) -> List[int]:
         if not fixture_ids: return []
         res = self.client.table("predictions").select("fixture_id").in_("fixture_id", fixture_ids).execute()
@@ -291,6 +314,16 @@ class DatabaseService:
                 self.client.table(table).upsert(batch, on_conflict=on_conflict).execute()
             except Exception as e:
                 logging.error(f"Error upserting to {table}: {e}")
+
+    def insert(self, table: str, models: List[BaseModel]):
+        if not models: return
+        data = [m.model_dump(mode='json', exclude_none=False) for m in models]
+        for i in range(0, len(data), 1000):
+            batch = data[i:i + 1000]
+            try:
+                self.client.table(table).insert(batch).execute()
+            except Exception as e:
+                logging.error(f"Error inserting to {table}: {e}")
 
 
 # ==============================================================================
@@ -437,17 +470,26 @@ class StandingsSyncCommand(Command):
 class IncrementalUpdateCommand(Command):
     def execute(self) -> bool:
         logging.info("Running Incremental Update...")
+
+        # 1. Atualização de PLACARES/STATUS (Jogos recentes e próximas 24h)
         live = self.db.get_fixture_ids(status_in=FixtureStatus.live())
         recent = self.db.get_fixture_ids(status_in=FixtureStatus.finished(), hours_lookback=6)
-        upcoming = self.db.get_fixture_ids(hours_lookahead=24)
+        upcoming_24h = self.db.get_fixture_ids(hours_lookahead=24)
 
-        priority = list(set(live + recent + upcoming))
-        if priority: self._process_fixtures(priority)
+        priority_fixtures = list(set(live + recent + upcoming_24h))
+        if priority_fixtures:
+            self._process_fixtures(priority_fixtures)
 
-        missing_pred = self.db.get_ids_missing_predictions(upcoming)
-        if missing_pred:
-            self._fetch_predictions(missing_pred)
-            self._fetch_injuries(missing_pred)
+        # 2. Atualização de PREDIÇÕES e LESÕES (Para TODOS os jogos NS do banco)
+        all_ns_fixtures = self.db.get_fixture_ids(status_in=["NS"])
+        target_ids = self.db.get_prediction_candidates(all_ns_fixtures, stale_hours=PREDICTION_STALE_HOURS)
+
+        if target_ids:
+            batch_to_process = target_ids[:PREDICTION_BATCH_SIZE]
+            logging.info(f"Updating predictions for {len(batch_to_process)} fixtures (Queue: {len(target_ids)})...")
+            self._fetch_predictions(batch_to_process)
+            self._fetch_injuries(batch_to_process)
+
         return True
 
     def _process_fixtures(self, fixture_ids: List[int]):
@@ -556,7 +598,6 @@ class IncrementalUpdateCommand(Command):
                     p = item["predictions"]
                     comp = item.get("comparison", {}).get("total", {})
 
-                    # LÓGICA HÍBRIDA: EMPATE (API) + FORÇA RELATIVA (COMPARISON)
                     raw_draw = p.get("percent", {}).get("draw")
                     prob_draw = float(raw_draw.strip("%")) / 100 if raw_draw else 0.25
 
@@ -565,7 +606,6 @@ class IncrementalUpdateCommand(Command):
                         comp_away = float(comp["away"].strip("%")) / 100
                         total_comp = comp_home + comp_away
                         if total_comp == 0: total_comp = 1
-
                         remaining_prob = 1.0 - prob_draw
                         prob_home = (comp_home / total_comp) * remaining_prob
                         prob_away = (comp_away / total_comp) * remaining_prob
@@ -591,8 +631,7 @@ class IncrementalUpdateCommand(Command):
 
     def _fetch_injuries(self, fixture_ids: List[int]):
         injuries_map = {}
-        players_map = {}  # Buffer para salvar jogadores inexistentes
-
+        players_map = {}
         for fid in fixture_ids:
             try:
                 data = self.api.get("injuries", {"fixture": fid})
@@ -601,41 +640,26 @@ class IncrementalUpdateCommand(Command):
                     pid = p.get("id")
                     if not pid: continue
 
-                    # 1. Capturar Jogador (Para evitar erro de Foreign Key)
-                    # O endpoint de injuries manda nome e foto, o que é suficiente para criar o registro
                     players_map[pid] = Player(
-                        id=pid,
-                        name=p["name"],
-                        photo=p.get("photo"),
-                        injured=True,  # Já marcamos como lesionado no perfil
-                        current_team_id=item["team"]["id"],
+                        id=pid, name=p["name"], photo=p.get("photo"),
+                        injured=True, current_team_id=item["team"]["id"],
                         updated_at=datetime.now(timezone.utc)
                     )
-
-                    # 2. Capturar Lesão
                     key = (fid, pid)
                     injuries_map[key] = FixtureInjury(
-                        fixture_id=fid,
-                        team_id=item["team"]["id"],
-                        player_id=pid,
-                        reason=p["reason"],
-                        type=p["type"]
+                        fixture_id=fid, team_id=item["team"]["id"], player_id=pid,
+                        reason=p["reason"], type=p["type"]
                     )
-            except Exception as e:
-                logging.error(f"Error fetching injuries for fixture {fid}: {e}")
+            except Exception:
                 continue
 
-        # 3. Salvar Jogadores ANTES das Lesões
-        if players_map:
-            self.db.upsert("players", list(players_map.values()))
+        if players_map: self.db.upsert("players", list(players_map.values()))
+        if injuries_map: self.db.upsert("fixture_injuries", list(injuries_map.values()), "fixture_id,player_id")
 
-        # 4. Salvar Lesões
-        if injuries_map:
-            self.db.upsert("fixture_injuries", list(injuries_map.values()), "fixture_id,player_id")
 
 class OddsSyncCommand(Command):
     def execute(self) -> bool:
-        logging.info("Syncing Odds (All Bookmakers)...")
+        logging.info("Syncing Odds (Top Bookmakers)...")
         upcoming = self.db.get_fixture_ids(status_in=["NS"], hours_lookahead=48)
         if not upcoming:
             logging.info("No upcoming fixtures found.")
@@ -643,41 +667,59 @@ class OddsSyncCommand(Command):
 
         logging.info(f"Scanning odds for {len(upcoming)} fixtures...")
 
+        # LISTA VIP DE BOOKMAKERS (IDs Oficiais da API-Football)
+        # 8: Bet365, 32: Betano, 23: Sportingbet, 3: Betfair, 11: 1xBet, 34: Superbet, 24: Betway
+        TARGET_BOOKMAKERS = {8, 32, 23, 3, 11, 34, 24}
+
         all_odds = []
         successful_fids = set()
 
         for fid in upcoming:
             try:
-                data = self.api.get("odds", {"fixture": fid})
-                response = data.get("response", [])
-                if not response: continue
+                page = 1
+                # Loop de Paginação (Pega todas as casas disponíveis para o jogo)
+                while True:
+                    data = self.api.get("odds", {"fixture": fid, "page": page})
+                    response = data.get("response", [])
 
-                item = response[0]
-                successful_fids.add(fid)
+                    if not response:
+                        break
 
-                # AGORA PEGAMOS TODAS AS ODDS DISPONÍVEIS, NÃO APENAS UMA
-                bookmakers = item.get("bookmakers", [])
-                for bm in bookmakers:
-                    for bet in bm.get("bets", []):
-                        if bet["name"] in ["Match Winner", "Both Teams To Score", "Goals Over/Under"]:
-                            for val in bet.get("values", []):
-                                all_odds.append(Odds(
-                                    fixture_id=fid,
-                                    bookmaker_name=bm["name"],
-                                    market_name=bet["name"],
-                                    value=str(val["value"]),
-                                    odd=float(val["odd"])
-                                ))
+                    item = response[0]
+                    successful_fids.add(fid)
+
+                    bookmakers = item.get("bookmakers", [])
+
+                    for bm in bookmakers:
+                        # Filtra apenas as casas que queremos
+                        if bm["id"] not in TARGET_BOOKMAKERS:
+                            continue
+
+                        for bet in bm.get("bets", []):
+                            if bet["name"] in ["Match Winner", "Both Teams To Score", "Goals Over/Under"]:
+                                for val in bet.get("values", []):
+                                    all_odds.append(Odds(
+                                        fixture_id=fid,
+                                        bookmaker_name=bm["name"],
+                                        market_name=bet["name"],
+                                        value=str(val["value"]),
+                                        odd=float(val["odd"])
+                                    ))
+
+                    paging = data.get("paging", {})
+                    if paging.get("current", 1) >= paging.get("total", 1):
+                        break
+                    page += 1
+
             except Exception as e:
                 logging.error(f"Error odds {fid}: {e}")
                 continue
 
         if all_odds:
-            # Limpa e insere (refresh completo para evitar duplicatas e odds velhas)
             if successful_fids:
                 self.db.client.table("odds").delete().in_("fixture_id", list(successful_fids)).execute()
-            self.db.upsert("odds", all_odds, "id")
-            logging.info(f"Synced {len(all_odds)} odds.")
+            self.db.insert("odds", all_odds)
+            logging.info(f"Synced {len(all_odds)} odds from top bookmakers.")
 
         return True
 
@@ -689,7 +731,7 @@ class FullLoadCommand(Command):
         StandingsSyncCommand(self.api, self.db).execute()
         leagues = self.db.get_active_leagues()
         now = datetime.now()
-        start_day, end_day = -10, 10
+        start_day, end_day = 0, 2
 
         for league_id in leagues:
             for day_offset in range(start_day, end_day):
