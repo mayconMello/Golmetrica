@@ -591,23 +591,47 @@ class IncrementalUpdateCommand(Command):
 
     def _fetch_injuries(self, fixture_ids: List[int]):
         injuries_map = {}
+        players_map = {}  # Buffer para salvar jogadores inexistentes
+
         for fid in fixture_ids:
             try:
                 data = self.api.get("injuries", {"fixture": fid})
                 for item in data.get("response", []):
                     p = item["player"]
-                    if not p.get("id"): continue
-                    key = (fid, p["id"])
-                    injuries_map[key] = FixtureInjury(
-                        fixture_id=fid, team_id=item["team"]["id"], player_id=p["id"],
-                        reason=p["reason"], type=p["type"]
+                    pid = p.get("id")
+                    if not pid: continue
+
+                    # 1. Capturar Jogador (Para evitar erro de Foreign Key)
+                    # O endpoint de injuries manda nome e foto, o que é suficiente para criar o registro
+                    players_map[pid] = Player(
+                        id=pid,
+                        name=p["name"],
+                        photo=p.get("photo"),
+                        injured=True,  # Já marcamos como lesionado no perfil
+                        current_team_id=item["team"]["id"],
+                        updated_at=datetime.now(timezone.utc)
                     )
-            except Exception:
+
+                    # 2. Capturar Lesão
+                    key = (fid, pid)
+                    injuries_map[key] = FixtureInjury(
+                        fixture_id=fid,
+                        team_id=item["team"]["id"],
+                        player_id=pid,
+                        reason=p["reason"],
+                        type=p["type"]
+                    )
+            except Exception as e:
+                logging.error(f"Error fetching injuries for fixture {fid}: {e}")
                 continue
 
+        # 3. Salvar Jogadores ANTES das Lesões
+        if players_map:
+            self.db.upsert("players", list(players_map.values()))
+
+        # 4. Salvar Lesões
         if injuries_map:
             self.db.upsert("fixture_injuries", list(injuries_map.values()), "fixture_id,player_id")
-
 
 class OddsSyncCommand(Command):
     def execute(self) -> bool:
@@ -665,7 +689,7 @@ class FullLoadCommand(Command):
         StandingsSyncCommand(self.api, self.db).execute()
         leagues = self.db.get_active_leagues()
         now = datetime.now()
-        start_day, end_day = 0, 2
+        start_day, end_day = -10, 10
 
         for league_id in leagues:
             for day_offset in range(start_day, end_day):
