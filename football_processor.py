@@ -589,39 +589,127 @@ class IncrementalUpdateCommand(Command):
         if player_stats_map: self.db.upsert("fixture_player_stats", list(player_stats_map.values()),
                                             "fixture_id,team_id,player_id")
 
+    def _compute_prediction_probs(self, item: Dict[str, Any], fixture_id: int) -> tuple[float, float, float]:
+        def parse_percent(value: Any) -> Optional[float]:
+            if value is None:
+                return None
+            try:
+                text = str(value).strip().replace("%", "").replace(",", ".")
+                if not text:
+                    return None
+                return float(text) / 100.0
+            except Exception:
+                return None
+
+        comparison = (item.get("comparison") or {}).get("total") or {}
+        total_home = parse_percent(comparison.get("home"))
+        total_away = parse_percent(comparison.get("away"))
+
+        if total_home is None or total_away is None:
+            total_home = 0.5
+            total_away = 0.5
+
+        s = total_home + total_away
+        if s <= 0:
+            s = 1.0
+            total_home = 0.5
+
+        base_home_nd = total_home / s
+
+        teams = item.get("teams") or {}
+        home_team_id = (teams.get("home") or {}).get("id")
+        away_team_id = (teams.get("away") or {}).get("id")
+
+        h2h_list = item.get("h2h") or []
+        h_home_wins = 0
+        h_away_wins = 0
+        h_draws = 0
+
+        for match in h2h_list:
+            m_teams = match.get("teams") or {}
+            m_goals = match.get("goals") or {}
+            mh_id = (m_teams.get("home") or {}).get("id")
+            ma_id = (m_teams.get("away") or {}).get("id")
+            gh = m_goals.get("home")
+            ga = m_goals.get("away")
+
+            if gh is None or ga is None:
+                continue
+
+            if gh == ga:
+                h_draws += 1
+                continue
+
+            winner_team_id = mh_id if gh > ga else ma_id
+
+            if winner_team_id == home_team_id:
+                h_home_wins += 1
+            elif winner_team_id == away_team_id:
+                h_away_wins += 1
+            else:
+                continue
+
+        h_total = h_home_wins + h_away_wins + h_draws
+
+        if h_total > 0:
+            non_draw_h = max(1, h_home_wins + h_away_wins)
+            h_home_nd = h_home_wins / non_draw_h
+            h_draw_rate = h_draws / h_total
+        else:
+            h_home_nd = base_home_nd
+            h_draw_rate = 0.25
+
+        alpha = min(0.6, h_total / 20.0)
+        blended_home_nd = (1.0 - alpha) * base_home_nd + alpha * h_home_nd
+        blended_away_nd = 1.0 - blended_home_nd
+
+        closeness = 1.0 - abs(blended_home_nd - blended_away_nd)
+        base_draw = 0.22 + 0.10 * closeness
+        beta = 0.5 if h_total > 0 else 0.0
+        raw_draw = (1.0 - beta) * base_draw + beta * h_draw_rate
+
+        raw_draw = max(0.10, min(0.35, raw_draw))
+
+        non_draw_mass = max(0.0, 1.0 - raw_draw)
+        home_prob = blended_home_nd * non_draw_mass
+        away_prob = blended_away_nd * non_draw_mass
+        draw_prob = raw_draw
+
+        total = home_prob + draw_prob + away_prob
+        if total <= 0:
+            return 1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0
+
+        home_prob /= total
+        draw_prob /= total
+        away_prob /= total
+
+        return home_prob, draw_prob, away_prob
+
     def _fetch_predictions(self, fixture_ids: List[int]):
-        preds = []
+        preds: List[Prediction] = []
+
         for fid in fixture_ids:
             try:
                 data = self.api.get("predictions", {"fixture": fid})
-                for item in data.get("response", []):
-                    p = item["predictions"]
-                    comp = item.get("comparison", {}).get("total", {})
+                response = data.get("response") or []
+                if not response:
+                    continue
 
-                    raw_draw = p.get("percent", {}).get("draw")
-                    prob_draw = float(raw_draw.strip("%")) / 100 if raw_draw else 0.25
+                for item in response:
+                    prob_home, prob_draw, prob_away = self._compute_prediction_probs(item, fid)
+                    p_block = item.get("predictions") or {}
 
-                    if comp.get("home") and comp.get("away"):
-                        comp_home = float(comp["home"].strip("%")) / 100
-                        comp_away = float(comp["away"].strip("%")) / 100
-                        total_comp = comp_home + comp_away
-                        if total_comp == 0: total_comp = 1
-                        remaining_prob = 1.0 - prob_draw
-                        prob_home = (comp_home / total_comp) * remaining_prob
-                        prob_away = (comp_away / total_comp) * remaining_prob
-                    else:
-                        raw_home = p.get("percent", {}).get("home")
-                        raw_away = p.get("percent", {}).get("away")
-                        prob_home = float(raw_home.strip("%")) / 100 if raw_home else 0.375
-                        prob_away = float(raw_away.strip("%")) / 100 if raw_away else 0.375
+                    preds.append(
+                        Prediction(
+                            fixture_id=fid,
+                            prob_home=round(prob_home, 4),
+                            prob_draw=round(prob_draw, 4),
+                            prob_away=round(prob_away, 4),
+                            advice=p_block.get("advice"),
+                            raw_json=item,
+                        )
+                    )
 
-                    preds.append(Prediction(
-                        fixture_id=fid,
-                        prob_home=round(prob_home, 4),
-                        prob_draw=round(prob_draw, 4),
-                        prob_away=round(prob_away, 4),
-                        advice=p.get("advice"), raw_json=item
-                    ))
             except Exception as e:
                 logging.error(f"Error prediction {fid}: {e}")
                 continue
@@ -747,6 +835,31 @@ class FullLoadCommand(Command):
         return True
 
 
+class RecalculatePredictionsCommand(Command):
+    def execute(self) -> bool:
+        logging.info("Recalculating predictions for all fixtures...")
+
+        fixture_ids = self.db.get_fixture_ids()
+        if not fixture_ids:
+            logging.info("No fixtures found in database.")
+            return False
+
+        logging.info(f"Found {len(fixture_ids)} fixtures to recalculate predictions.")
+
+        incremental_cmd = IncrementalUpdateCommand(self.api, self.db)
+
+        for i in range(0, len(fixture_ids), PREDICTION_BATCH_SIZE):
+            batch = fixture_ids[i:i + PREDICTION_BATCH_SIZE]
+            logging.info(
+                f"Processing prediction batch {i // PREDICTION_BATCH_SIZE + 1} "
+                f"({len(batch)} fixtures)..."
+            )
+            incremental_cmd._fetch_predictions(batch)
+
+        logging.info("Finished recalculating predictions for all fixtures.")
+        return True
+
+
 class FootballProcessor:
     def __init__(self):
         self.api = APIClient(AF_API_KEY, AF_BASE_URL)
@@ -759,7 +872,8 @@ class FootballProcessor:
             "leagues": LeagueSyncCommand,
             "standings": StandingsSyncCommand,
             "odds": OddsSyncCommand,
-            "squads": SquadSyncCommand
+            "squads": SquadSyncCommand,
+            "recalc_predictions": RecalculatePredictionsCommand,
         }
         if command_name == "auto":
             hour = datetime.now().hour
