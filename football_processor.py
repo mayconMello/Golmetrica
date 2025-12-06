@@ -4,21 +4,18 @@ import time
 from abc import ABC, abstractmethod
 from datetime import datetime, timedelta, timezone
 from enum import Enum
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional
 
+import math
 import requests
 from decouple import config
 from pydantic import BaseModel, Field
 from slugify import slugify
 from supabase import create_client, Client
 
-# ==============================================================================
-# CONFIGURAÇÃO
-# ==============================================================================
 LOG_LEVEL = config("LOG_LEVEL", default="INFO").upper()
 logging.basicConfig(level=getattr(logging, LOG_LEVEL), format="%(asctime)s - %(levelname)s - %(message)s")
 
-# Tenta Service Key (Escrita), senão Anon (Leitura)
 SUPABASE_URL = config("SUPABASE_URL")
 SUPABASE_KEY = config("SUPABASE_SERVICE_KEY", default=config("SUPABASE_ANON_KEY", default=None))
 
@@ -32,14 +29,9 @@ DEFAULT_TZ = config("DEFAULT_TIMEZONE", default="America/Sao_Paulo")
 SEASON = int(config("AF_SEASON", default="2025"))
 MAX_IDS_PER_BATCH = int(config("MAX_IDS_PER_BATCH", default=20))
 
-# Configuração de validade das predições (em horas)
 PREDICTION_STALE_HOURS = int(config("PREDICTION_STALE_HOURS", default=24))
 PREDICTION_BATCH_SIZE = int(config("PREDICTION_BATCH_SIZE", default=50))
 
-
-# ==============================================================================
-# MODELOS (PYDANTIC)
-# ==============================================================================
 
 class FixtureStatus(str, Enum):
     NS = "NS"
@@ -230,10 +222,6 @@ class Standing(BaseModel):
     update_time: datetime
 
 
-# ==============================================================================
-# SERVIÇOS
-# ==============================================================================
-
 class APIClient:
     def __init__(self, api_key: str, base_url: str):
         self.api_key = api_key
@@ -266,7 +254,7 @@ class DatabaseService:
         return [r["id"] for r in res.data]
 
     def get_fixture_ids(self, status_in: List[str] = None, hours_lookback: int = None, hours_lookahead: int = None) -> \
-    List[int]:
+            List[int]:
         query = self.client.table("fixtures").select("id")
         now = datetime.now(timezone.utc)
         if status_in:
@@ -325,10 +313,6 @@ class DatabaseService:
             except Exception as e:
                 logging.error(f"Error inserting to {table}: {e}")
 
-
-# ==============================================================================
-# COMANDOS
-# ==============================================================================
 
 class Command(ABC):
     def __init__(self, api: APIClient, db: DatabaseService):
@@ -471,7 +455,6 @@ class IncrementalUpdateCommand(Command):
     def execute(self) -> bool:
         logging.info("Running Incremental Update...")
 
-        # 1. Atualização de PLACARES/STATUS (Jogos recentes e próximas 24h)
         live = self.db.get_fixture_ids(status_in=FixtureStatus.live())
         recent = self.db.get_fixture_ids(status_in=FixtureStatus.finished(), hours_lookback=6)
         upcoming_24h = self.db.get_fixture_ids(hours_lookahead=24)
@@ -480,7 +463,6 @@ class IncrementalUpdateCommand(Command):
         if priority_fixtures:
             self._process_fixtures(priority_fixtures)
 
-        # 2. Atualização de PREDIÇÕES e LESÕES (Para TODOS os jogos NS do banco)
         all_ns_fixtures = self.db.get_fixture_ids(status_in=["NS"])
         target_ids = self.db.get_prediction_candidates(all_ns_fixtures, stale_hours=PREDICTION_STALE_HOURS)
 
@@ -589,101 +571,163 @@ class IncrementalUpdateCommand(Command):
         if player_stats_map: self.db.upsert("fixture_player_stats", list(player_stats_map.values()),
                                             "fixture_id,team_id,player_id")
 
+    def _get_injury_impact(self, fixture_id: int, home_id: int, away_id: int) -> tuple[float, float]:
+        try:
+            res = self.db.client.table("fixture_injuries").select("*").eq("fixture_id", fixture_id).execute()
+            injuries = res.data or []
+        except Exception:
+            return 1.0, 1.0
+
+        if not injuries:
+            return 1.0, 1.0
+
+        home_penalty = 0.0
+        away_penalty = 0.0
+
+        for inj in injuries:
+            weight = 0.0
+            itype = str(inj.get("type", "")).lower()
+
+            if "missing" in itype:
+                weight = 1.0
+            elif "questionable" in itype:
+                weight = 0.5
+
+            impact = 0.04 * weight
+
+            if inj.get("team_id") == home_id:
+                home_penalty += impact
+            elif inj.get("team_id") == away_id:
+                away_penalty += impact
+
+        h_factor = max(0.60, 1.0 - home_penalty)
+        a_factor = max(0.60, 1.0 - away_penalty)
+
+        return h_factor, a_factor
+
+    def _calculate_poisson_probs(self, lambda_home, lambda_away):
+        prob_home = 0.0
+        prob_draw = 0.0
+        prob_away = 0.0
+
+        total_lambda = lambda_home + lambda_away
+        draw_adjustment = 1.15 if total_lambda < 2.0 else 1.0
+
+        def poisson(k, lamb):
+            if lamb <= 0: return 0.0 if k > 0 else 1.0
+            return (lamb ** k) * math.exp(-lamb) / math.factorial(k)
+
+        for h in range(7):
+            for a in range(7):
+                p = poisson(h, lambda_home) * poisson(a, lambda_away)
+                if h > a:
+                    prob_home += p
+                elif h == a:
+                    prob_draw += p
+                else:
+                    prob_away += p
+
+        prob_draw *= draw_adjustment
+        total = prob_home + prob_draw + prob_away
+
+        if total == 0: return 0.33, 0.34, 0.33
+
+        return prob_home / total, prob_draw / total, prob_away / total
+
     def _compute_prediction_probs(self, item: Dict[str, Any], fixture_id: int) -> tuple[float, float, float]:
-        def parse_percent(value: Any) -> Optional[float]:
-            if value is None:
-                return None
-            try:
-                text = str(value).strip().replace("%", "").replace(",", ".")
-                if not text:
-                    return None
-                return float(text) / 100.0
-            except Exception:
-                return None
+        teams = item.get("teams", {})
+        home_data = teams.get("home", {})
+        away_data = teams.get("away", {})
 
-        comparison = (item.get("comparison") or {}).get("total") or {}
-        total_home = parse_percent(comparison.get("home"))
-        total_away = parse_percent(comparison.get("away"))
+        try:
+            s_home_att = float(
+                home_data.get("league", {}).get("goals", {}).get("for", {}).get("average", {}).get("home") or 1.1)
+            s_home_def = float(
+                home_data.get("league", {}).get("goals", {}).get("against", {}).get("average", {}).get("home") or 1.1)
+            s_away_att = float(
+                away_data.get("league", {}).get("goals", {}).get("for", {}).get("average", {}).get("away") or 1.1)
+            s_away_def = float(
+                away_data.get("league", {}).get("goals", {}).get("against", {}).get("average", {}).get("away") or 1.1)
 
-        if total_home is None or total_away is None:
-            total_home = 0.5
-            total_away = 0.5
+            l5_home_att = float(
+                home_data.get("last_5", {}).get("goals", {}).get("for", {}).get("average") or s_home_att)
+            l5_home_def = float(
+                home_data.get("last_5", {}).get("goals", {}).get("against", {}).get("average") or s_home_def)
+            l5_away_att = float(
+                away_data.get("last_5", {}).get("goals", {}).get("for", {}).get("average") or s_away_att)
+            l5_away_def = float(
+                away_data.get("last_5", {}).get("goals", {}).get("against", {}).get("average") or s_away_def)
 
-        s = total_home + total_away
-        if s <= 0:
-            s = 1.0
-            total_home = 0.5
+            W_SEASON = 0.45
+            W_FORM = 0.55
 
-        base_home_nd = total_home / s
+            home_att = (s_home_att * W_SEASON) + (l5_home_att * W_FORM)
+            home_def = (s_home_def * W_SEASON) + (l5_home_def * W_FORM)
+            away_att = (s_away_att * W_SEASON) + (l5_away_att * W_FORM)
+            away_def = (s_away_def * W_SEASON) + (l5_away_def * W_FORM)
 
-        teams = item.get("teams") or {}
-        home_team_id = (teams.get("home") or {}).get("id")
-        away_team_id = (teams.get("away") or {}).get("id")
+        except Exception:
+            home_att, home_def = 1.2, 1.0
+            away_att, away_def = 1.0, 1.2
+
+        h_factor, a_factor = self._get_injury_impact(fixture_id, home_data.get("id"), away_data.get("id"))
+
+        home_att *= h_factor
+        home_def *= (1.0 + (1.0 - h_factor) * 1.5)
+        away_att *= a_factor
+        away_def *= (1.0 + (1.0 - a_factor) * 1.5)
+
+        lambda_home = (home_att + away_def) / 2 * 1.12
+        lambda_away = (away_att + home_def) / 2
+
+        p_home, p_draw, p_away = self._calculate_poisson_probs(lambda_home, lambda_away)
 
         h2h_list = item.get("h2h") or []
-        h_home_wins = 0
-        h_away_wins = 0
-        h_draws = 0
+        h_score = 0
+        if h2h_list:
+            home_id = home_data.get("id")
+            for match in h2h_list:
+                goals = match.get("goals", {})
+                if goals.get("home") is None: continue
+                gh, ga = goals["home"], goals["away"]
+                winner_id = match.get("teams", {}).get("home", {}).get("id") if gh > ga else match.get("teams", {}).get(
+                    "away", {}).get("id") if ga > gh else None
+                if winner_id == home_id:
+                    h_score += 1
+                elif winner_id:
+                    h_score -= 1
 
-        for match in h2h_list:
-            m_teams = match.get("teams") or {}
-            m_goals = match.get("goals") or {}
-            mh_id = (m_teams.get("home") or {}).get("id")
-            ma_id = (m_teams.get("away") or {}).get("id")
-            gh = m_goals.get("home")
-            ga = m_goals.get("away")
+        h2h_impact = max(-0.06, min(0.06, h_score * 0.02))
 
-            if gh is None or ga is None:
-                continue
+        def get_momentum(form_str):
+            if not form_str: return 0.0
+            pts = 0
+            for char in form_str[-5:]:
+                if char == 'W':
+                    pts += 3
+                elif char == 'D':
+                    pts += 1
+            return pts
 
-            if gh == ga:
-                h_draws += 1
-                continue
+        h_mom = get_momentum(home_data.get("league", {}).get("form", ""))
+        a_mom = get_momentum(away_data.get("league", {}).get("form", ""))
+        mom_diff = (h_mom - a_mom) / 15.0
+        mom_impact = mom_diff * 0.08
 
-            winner_team_id = mh_id if gh > ga else ma_id
+        final_home = p_home + h2h_impact + mom_impact
+        final_away = p_away - h2h_impact - mom_impact
+        final_draw = p_draw
 
-            if winner_team_id == home_team_id:
-                h_home_wins += 1
-            elif winner_team_id == away_team_id:
-                h_away_wins += 1
-            else:
-                continue
+        final_home = max(0.01, final_home)
+        final_away = max(0.01, final_away)
 
-        h_total = h_home_wins + h_away_wins + h_draws
+        if abs(final_home - final_away) < 0.10:
+            final_draw += 0.04
+            final_home -= 0.02
+            final_away -= 0.02
 
-        if h_total > 0:
-            non_draw_h = max(1, h_home_wins + h_away_wins)
-            h_home_nd = h_home_wins / non_draw_h
-            h_draw_rate = h_draws / h_total
-        else:
-            h_home_nd = base_home_nd
-            h_draw_rate = 0.25
-
-        alpha = min(0.6, h_total / 20.0)
-        blended_home_nd = (1.0 - alpha) * base_home_nd + alpha * h_home_nd
-        blended_away_nd = 1.0 - blended_home_nd
-
-        closeness = 1.0 - abs(blended_home_nd - blended_away_nd)
-        base_draw = 0.22 + 0.10 * closeness
-        beta = 0.5 if h_total > 0 else 0.0
-        raw_draw = (1.0 - beta) * base_draw + beta * h_draw_rate
-
-        raw_draw = max(0.10, min(0.35, raw_draw))
-
-        non_draw_mass = max(0.0, 1.0 - raw_draw)
-        home_prob = blended_home_nd * non_draw_mass
-        away_prob = blended_away_nd * non_draw_mass
-        draw_prob = raw_draw
-
-        total = home_prob + draw_prob + away_prob
-        if total <= 0:
-            return 1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0
-
-        home_prob /= total
-        draw_prob /= total
-        away_prob /= total
-
-        return home_prob, draw_prob, away_prob
+        total = final_home + final_draw + final_away
+        return final_home / total, final_draw / total, final_away / total
 
     def _fetch_predictions(self, fixture_ids: List[int]):
         preds: List[Prediction] = []
@@ -755,8 +799,6 @@ class OddsSyncCommand(Command):
 
         logging.info(f"Scanning odds for {len(upcoming)} fixtures...")
 
-        # LISTA VIP DE BOOKMAKERS (IDs Oficiais da API-Football)
-        # 8: Bet365, 32: Betano, 23: Sportingbet, 3: Betfair, 11: 1xBet, 34: Superbet, 24: Betway
         TARGET_BOOKMAKERS = {8, 32, 23, 3, 11, 34, 24}
 
         all_odds = []
@@ -765,7 +807,7 @@ class OddsSyncCommand(Command):
         for fid in upcoming:
             try:
                 page = 1
-                # Loop de Paginação (Pega todas as casas disponíveis para o jogo)
+
                 while True:
                     data = self.api.get("odds", {"fixture": fid, "page": page})
                     response = data.get("response", [])
@@ -779,7 +821,7 @@ class OddsSyncCommand(Command):
                     bookmakers = item.get("bookmakers", [])
 
                     for bm in bookmakers:
-                        # Filtra apenas as casas que queremos
+
                         if bm["id"] not in TARGET_BOOKMAKERS:
                             continue
 
@@ -839,7 +881,7 @@ class RecalculatePredictionsCommand(Command):
     def execute(self) -> bool:
         logging.info("Recalculating predictions for all fixtures...")
 
-        fixture_ids = self.db.get_fixture_ids()
+        fixture_ids = self.db.get_fixture_ids(status_in=['NS'])
         if not fixture_ids:
             logging.info("No fixtures found in database.")
             return False
