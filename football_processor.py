@@ -4,7 +4,7 @@ import time
 from abc import ABC, abstractmethod
 from datetime import datetime, timedelta, timezone
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import math
 import requests
@@ -293,6 +293,21 @@ class DatabaseService:
         existing = {r["fixture_id"] for r in res.data}
         return [fid for fid in fixture_ids if fid not in existing]
 
+    def get_fixture_events(self, fixture_ids: List[int]) -> List[Dict[str, Any]]:
+        if not fixture_ids:
+            return []
+        try:
+            res = (
+                self.client.table("fixture_events")
+                .select("fixture_id,time_elapsed,time_extra,team_id,player_id,assist_id,type,detail")
+                .in_("fixture_id", fixture_ids)
+                .execute()
+            )
+            return res.data or []
+        except Exception as e:
+            logging.error(f"Error fetching fixture events for deduplication: {e}")
+            return []
+
     def upsert(self, table: str, models: List[BaseModel], on_conflict: str = "id"):
         if not models: return
         data = [m.model_dump(mode='json', exclude_none=False) for m in models]
@@ -483,7 +498,7 @@ class IncrementalUpdateCommand(Command):
     def _parse_and_save(self, response: List[Dict[str, Any]]):
         fixtures, teams, players = [], {}, {}
         lineups_map, lineup_players_map = {}, {}
-        events, stats_map, player_stats_map = [], {}, {}
+        events_map, stats_map, player_stats_map = {}, {}, {}
 
         for item in response:
             f, l, t, g, s = item["fixture"], item["league"], item["teams"], item["goals"], item["score"]
@@ -527,11 +542,23 @@ class IncrementalUpdateCommand(Command):
                                               photo=f"https://media.api-sports.io/football/players/{pid}.png")
                 if aid: players[aid] = Player(id=aid, name=ev["assist"]["name"],
                                               photo=f"https://media.api-sports.io/football/players/{aid}.png")
-                events.append(FixtureEvent(
-                    fixture_id=f["id"], time_elapsed=ev["time"].get("elapsed"), time_extra=ev["time"].get("extra"),
-                    team_id=ev["team"].get("id"), player_id=pid, assist_id=aid, type=ev.get("type"),
-                    detail=ev.get("detail"), comments=ev.get("comments")
-                ))
+                e_key = self._build_event_key(
+                    f["id"],
+                    ev["time"].get("elapsed"),
+                    ev["time"].get("extra"),
+                    ev["team"].get("id"),
+                    pid,
+                    aid,
+                    ev.get("type"),
+                    ev.get("detail"),
+                )
+                if e_key not in events_map:
+                    events_map[e_key] = FixtureEvent(
+                        fixture_id=f["id"], time_elapsed=ev["time"].get("elapsed"),
+                        time_extra=ev["time"].get("extra"),
+                        team_id=ev["team"].get("id"), player_id=pid, assist_id=aid, type=ev.get("type"),
+                        detail=ev.get("detail"), comments=ev.get("comments")
+                    )
 
             for p_team in item.get("players", []):
                 tid = p_team["team"]["id"]
@@ -566,10 +593,44 @@ class IncrementalUpdateCommand(Command):
         if lineups_map: self.db.upsert("fixture_lineups", list(lineups_map.values()), "fixture_id,team_id")
         if lineup_players_map: self.db.upsert("fixture_lineup_players", list(lineup_players_map.values()),
                                               "fixture_id,team_id,player_id")
-        if events: self.db.upsert("fixture_events", events, "id")
+        if events_map:
+            fixture_ids_with_events = {evt.fixture_id for evt in events_map.values()}
+            existing_keys: Set[Tuple[Any, ...]] = {
+                self._build_event_key(
+                    row.get("fixture_id"), row.get("time_elapsed"), row.get("time_extra"),
+                    row.get("team_id"), row.get("player_id"), row.get("assist_id"),
+                    row.get("type"), row.get("detail")
+                )
+                for row in self.db.get_fixture_events(list(fixture_ids_with_events))
+            }
+            new_events = [evt for key, evt in events_map.items() if key not in existing_keys]
+            if new_events:
+                self.db.insert("fixture_events", new_events)
         if stats_map: self.db.upsert("fixture_statistics", list(stats_map.values()), "fixture_id,team_id,type")
         if player_stats_map: self.db.upsert("fixture_player_stats", list(player_stats_map.values()),
                                             "fixture_id,team_id,player_id")
+
+    @staticmethod
+    def _build_event_key(
+        fixture_id,
+        time_elapsed,
+        time_extra,
+        team_id,
+        player_id,
+        assist_id,
+        event_type,
+        detail,
+    ) -> Tuple[Any, ...]:
+        return (
+            fixture_id,
+            time_elapsed,
+            time_extra,
+            team_id,
+            player_id,
+            assist_id,
+            (event_type or "").strip(),
+            (detail or "").strip(),
+        )
 
     def _get_injury_impact(self, fixture_id: int, home_id: int, away_id: int) -> tuple[float, float]:
         try:
